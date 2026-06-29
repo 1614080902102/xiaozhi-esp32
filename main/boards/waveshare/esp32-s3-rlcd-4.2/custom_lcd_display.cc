@@ -393,8 +393,8 @@ void CustomLcdDisplay::BuildDashboardUI() {
     lv_obj_set_style_border_width(col, 0, 0);
     lv_obj_set_style_bg_color(col, bg, 0);
     lv_obj_set_style_pad_all(col, theme->spacing(3), 0);
-    // 左侧屏幕有物理坏点+贴边竖线：内容整体右移，避开左缘约 30px
-    lv_obj_set_style_pad_left(col, 30, 0);
+    // 左侧屏幕有物理坏点+贴边竖线：内容整体右移，避开左缘约 18px
+    lv_obj_set_style_pad_left(col, 18, 0);
     lv_obj_set_style_pad_row(col, theme->spacing(2), 0);
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_OFF);
@@ -561,10 +561,9 @@ void CustomLcdDisplay::SetupUI() {
     BuildDashboardUI();
     // 3. 默认载入信息板（空闲屏）
     ShowDashboard();
-    // 4. M2：喂假数据 + 本地占位，单验布局/渲染（不联网）
-    UpdateDashboard(MakeFakeDashboardData());
-    SetClock("15:00", "6/29 周一");
-    SetIndoor(26.5f, 58.0f);
+    // 4. M3：真实数据由板子的时钟/SHTC3/数据桥任务驱动；
+    //    这里只留 BuildDashboardUI 的占位（--:-- / 室内 --°C / 加载中…），
+    //    任务起来后即被真值覆盖。
     // 5. 起切屏轮询任务
     if (screen_task_ == nullptr) {
         xTaskCreate(ScreenSwitchTask, "dash_switch", 4096, this, 3, &screen_task_);

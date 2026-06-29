@@ -12,6 +12,18 @@
 #include "mcp_server.h"
 #include "lvgl.h"
 #include "custom_lcd_display.h"
+#include "settings.h"
+
+#include <ctime>
+#include <cstdio>
+#include <string>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_timer.h>
+#include <esp_http_client.h>
+#include "dashboard/dashboard_data.h"
+#include "dashboard/dashboard_json.h"
+#include "dashboard/shtc3.h"
 
 #define TAG "waveshare_rlcd_4_2"
 
@@ -23,6 +35,7 @@ private:
     adc_oneshot_unit_handle_t adc1_handle;
     adc_cali_handle_t cali_handle;
     bool vbat_status = 0;
+    i2c_master_dev_handle_t shtc3_dev_ = nullptr;   // 板载温湿度传感器
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {};
@@ -74,6 +87,139 @@ private:
         spi_config.cs = RLCD_CS_PIN;
         spi_config.rst = RLCD_RST_PIN;
         display_ = new CustomLcdDisplay(NULL, NULL, RLCD_WIDTH,RLCD_HEIGHT,DISPLAY_OFFSET_X,DISPLAY_OFFSET_Y,DISPLAY_MIRROR_X,DISPLAY_MIRROR_Y,DISPLAY_SWAP_XY,spi_config);
+    }
+
+    // ===== M3：真实数据服务（时钟 / 温湿度 / 数据桥拉取）=====
+
+    // 拉一次 dashboard.json 并解析。成功返回 true 并填 out。
+    bool FetchDashboard(const std::string& url, DashboardData& out) {
+        esp_http_client_config_t cfg = {};
+        cfg.url = url.c_str();
+        cfg.timeout_ms = 6000;
+        esp_http_client_handle_t client = esp_http_client_init(&cfg);
+        if (client == nullptr) return false;
+
+        bool ok = false;
+        esp_err_t err = esp_http_client_open(client, 0);
+        if (err == ESP_OK) {
+            esp_http_client_fetch_headers(client);
+            std::string body;
+            char buf[512];
+            int r;
+            while ((r = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
+                body.append(buf, r);
+                if (body.size() > 16384) break;   // 安全上限，dashboard.json 很小
+            }
+            int status = esp_http_client_get_status_code(client);
+            esp_http_client_close(client);
+            if (status == 200 && !body.empty()) {
+                DashboardData parsed;
+                if (ParseDashboardJson(body.c_str(), parsed)) { out = parsed; ok = true; }
+            } else {
+                ESP_LOGW(TAG, "dashboard http status=%d len=%d", status, (int)body.size());
+            }
+        } else {
+            ESP_LOGW(TAG, "dashboard http open failed: %s", esp_err_to_name(err));
+        }
+        esp_http_client_cleanup(client);
+        return ok;
+    }
+
+    // 时钟任务：每秒刷本地时间（时间由服务器 OTA 校准，TZ=东八区）
+    static void ClockTask(void* arg) {
+        auto* self = static_cast<CustomBoard*>(arg);
+        setenv("TZ", "CST-8", 1);
+        tzset();
+        static const char* kWeekday[7] = {"周日","周一","周二","周三","周四","周五","周六"};
+        for (;;) {
+            time_t now = time(nullptr);
+            struct tm tm_now;
+            localtime_r(&now, &tm_now);
+            if (tm_now.tm_year + 1900 >= 2024) {   // 时间已校准才显示
+                char hhmm[8];
+                snprintf(hhmm, sizeof(hhmm), "%02d:%02d", tm_now.tm_hour, tm_now.tm_min);
+                char dw[40];
+                snprintf(dw, sizeof(dw), "%d/%d %s", tm_now.tm_mon + 1, tm_now.tm_mday,
+                         kWeekday[tm_now.tm_wday]);
+                self->display_->SetClock(hhmm, dw);
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+
+    // 温湿度任务：每 30s 读板载 SHTC3
+    static void Shtc3Task(void* arg) {
+        auto* self = static_cast<CustomBoard*>(arg);
+        if (Shtc3AddDevice(self->i2c_bus_, &self->shtc3_dev_) != ESP_OK) {
+            ESP_LOGW(TAG, "SHTC3 add device failed; indoor temp disabled");
+            vTaskDelete(nullptr);
+            return;
+        }
+        for (;;) {
+            float t = 0, rh = 0;
+            if (Shtc3Read(self->shtc3_dev_, &t, &rh) == ESP_OK) {
+                self->display_->SetIndoor(t, rh);
+                ESP_LOGI(TAG, "SHTC3 %.1fC %.0f%%", t, rh);
+            } else {
+                ESP_LOGW(TAG, "SHTC3 read failed");
+            }
+            vTaskDelay(pdMS_TO_TICKS(30000));
+        }
+    }
+
+    // 数据桥任务：每 5min 拉 dashboard.json；失败保留缓存 + stale 角标；
+    // 未配置 URL 时屏上提示用语音设置。
+    static void DashboardClientTask(void* arg) {
+        auto* self = static_cast<CustomBoard*>(arg);
+        DashboardData cache;
+        bool have_data = false;
+        int64_t last_ok_us = 0;
+        vTaskDelay(pdMS_TO_TICKS(8000));   // 等 WiFi / 系统起来
+        for (;;) {
+            std::string url;
+            { Settings s("dashboard", false); url = s.GetString("url", ""); }
+
+            if (url.empty()) {
+                DashboardData d;
+                d.lunch = "（语音说「设置信息板地址」配置数据源）";
+                self->display_->UpdateDashboard(d);
+                vTaskDelay(pdMS_TO_TICKS(30000));
+                continue;
+            }
+
+            DashboardData fetched;
+            if (self->FetchDashboard(url, fetched)) {
+                cache = fetched;
+                cache.stale_minutes = 0;
+                have_data = true;
+                last_ok_us = esp_timer_get_time();
+                self->display_->UpdateDashboard(cache);
+                ESP_LOGI(TAG, "dashboard updated");
+            } else if (have_data) {
+                cache.stale_minutes = (int)((esp_timer_get_time() - last_ok_us) / 60000000LL);
+                self->display_->UpdateDashboard(cache);
+                ESP_LOGW(TAG, "dashboard fetch failed, stale %d min", cache.stale_minutes);
+            }
+            vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));
+        }
+    }
+
+    void InitializeDashboardServices() {
+        // MCP 工具：运行时设置数据源地址（存 NVS）
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.dashboard.set_url",
+            "设置冰箱信息板的数据源地址（数据桥 dashboard.json 的完整 URL）",
+            PropertyList({ Property("url", kPropertyTypeString) }),
+            [](const PropertyList& props) -> ReturnValue {
+                auto url = props["url"].value<std::string>();
+                Settings s("dashboard", true);
+                s.SetString("url", url);
+                return true;
+            });
+
+        xTaskCreate(ClockTask,           "dash_clock", 3072, this, 3, nullptr);
+        xTaskCreate(Shtc3Task,           "dash_shtc3", 3072, this, 3, nullptr);
+        xTaskCreate(DashboardClientTask, "dash_http",  8192, this, 4, nullptr);
     }
 
     uint16_t BatterygetVoltage(void) {
@@ -131,10 +277,11 @@ private:
 
 public:
     CustomBoard() : boot_button_(BOOT_BUTTON_GPIO) {    
-        InitializeI2c();  
-        InitializeButtons();     
+        InitializeI2c();
+        InitializeButtons();
         InitializeTools();
         InitializeLcdDisplay();
+        InitializeDashboardServices();
    }
 
     virtual AudioCodec* GetAudioCodec() override {
