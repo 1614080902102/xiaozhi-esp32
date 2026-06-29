@@ -1,16 +1,21 @@
 #include <vector>
 #include <cstring>
+#include <cstdio>
 #include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_log.h>
 #include <esp_err.h>
 #include "custom_lcd_display.h"
 #include "lcd_display.h"
+#include "lvgl_theme.h"
 #include "esp_lvgl_port.h"
 #include "assets/lang_config.h"
 #include "settings.h"
 #include "config.h"
 #include "board.h"
+#include "application.h"
+#include "device_state.h"
 
 void CustomLcdDisplay::Lvgl_flush_cb(lv_display_t * disp, const lv_area_t * area, uint8_t * color_p)
 {
@@ -335,4 +340,233 @@ void CustomLcdDisplay::RLCD_Display() {
   	RLCD_SendCommand(0x2c);     // Page Address Set
 
 	RLCD_Sendbuffera(DispBuffer,DisplayLen);
+}
+
+// ============================================================================
+// 冰箱信息板（dashboard）—— Phase 1 / M2
+// 在基类聊天屏之上叠一块独立 LVGL 屏，空闲常驻信息板，唤醒切聊天。
+// 所有刷新方法自带 display 锁，可跨任务调用。
+// ============================================================================
+
+// 在 parent 下加一条 1px 分隔线
+static lv_obj_t* DashDivider(lv_obj_t* parent, lv_color_t color) {
+    lv_obj_t* line = lv_obj_create(parent);
+    lv_obj_set_size(line, LV_PCT(100), 1);
+    lv_obj_set_style_radius(line, 0, 0);
+    lv_obj_set_style_bg_color(line, color, 0);
+    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(line, 0, 0);
+    lv_obj_set_style_pad_all(line, 0, 0);
+    lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    return line;
+}
+
+// 在 parent 下加一个左对齐自动换行的文本标签
+static lv_obj_t* DashLabel(lv_obj_t* parent, const lv_font_t* font, lv_color_t color,
+                           const char* text) {
+    lv_obj_t* lbl = lv_label_create(parent);
+    lv_obj_set_width(lbl, LV_PCT(100));
+    lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(lbl, font, 0);
+    lv_obj_set_style_text_color(lbl, color, 0);
+    lv_label_set_text(lbl, text);
+    return lbl;
+}
+
+void CustomLcdDisplay::BuildDashboardUI() {
+    DisplayLockGuard lock(this);
+
+    auto theme = static_cast<LvglTheme*>(current_theme_);
+    auto font  = theme->text_font()->font();
+    lv_color_t fg = theme->text_color();
+    lv_color_t bg = theme->background_color();
+
+    dashboard_screen_ = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(dashboard_screen_, bg, 0);
+    lv_obj_set_style_text_font(dashboard_screen_, font, 0);
+    lv_obj_set_style_text_color(dashboard_screen_, fg, 0);
+
+    // 纵向 flex 容器，铺满屏
+    lv_obj_t* col = lv_obj_create(dashboard_screen_);
+    lv_obj_set_size(col, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_radius(col, 0, 0);
+    lv_obj_set_style_border_width(col, 0, 0);
+    lv_obj_set_style_bg_color(col, bg, 0);
+    lv_obj_set_style_pad_all(col, theme->spacing(3), 0);
+    // 左侧屏幕有物理坏点+贴边竖线：内容整体右移，避开左缘约 30px
+    lv_obj_set_style_pad_left(col, 30, 0);
+    lv_obj_set_style_pad_row(col, theme->spacing(2), 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+
+    // —— 顶栏：左 日期/周/时间，右 天气（一行 space-between）——
+    lv_obj_t* top = lv_obj_create(col);
+    lv_obj_set_size(top, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(top, 0, 0);
+    lv_obj_set_style_border_width(top, 0, 0);
+    lv_obj_set_style_bg_opa(top, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(top, 0, 0);
+    lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(top, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(top, LV_OBJ_FLAG_SCROLLABLE);
+
+    dash_clock_ = lv_label_create(top);
+    lv_obj_set_style_text_font(dash_clock_, font, 0);
+    lv_obj_set_style_text_color(dash_clock_, fg, 0);
+    lv_label_set_text(dash_clock_, "--:--");
+
+    dash_weather_ = lv_label_create(top);
+    lv_obj_set_style_text_font(dash_weather_, font, 0);
+    lv_obj_set_style_text_color(dash_weather_, fg, 0);
+    lv_label_set_text(dash_weather_, "—");
+
+    // 室内温湿度（本地 SHTC3）
+    dash_indoor_ = DashLabel(col, font, fg, "室内 --°C  湿度 --%");
+
+    DashDivider(col, fg);
+
+    // —— 三餐 ——
+    DashLabel(col, font, fg, "今日三餐");
+    dash_meals_ = DashLabel(col, font, fg, "加载中…");
+
+    DashDivider(col, fg);
+
+    // —— 冰箱库存 ——
+    DashLabel(col, font, fg, "冰箱（易腐先吃）");
+    dash_fridge_ = DashLabel(col, font, fg, "加载中…");
+
+    DashDivider(col, fg);
+
+    // —— 语音提示条 ——
+    dash_hint_ = DashLabel(col, font, fg, "喊「你好小智」问菜谱");
+
+    // —— stale 角标（默认隐藏，异常时显示在右下）——
+    dash_stale_ = lv_label_create(dashboard_screen_);
+    lv_obj_set_style_text_font(dash_stale_, font, 0);
+    lv_obj_set_style_text_color(dash_stale_, fg, 0);
+    lv_label_set_text(dash_stale_, "");
+    lv_obj_align(dash_stale_, LV_ALIGN_BOTTOM_RIGHT, -theme->spacing(2), -theme->spacing(2));
+    lv_obj_add_flag(dash_stale_, LV_OBJ_FLAG_HIDDEN);
+}
+
+void CustomLcdDisplay::UpdateDashboard(const DashboardData& d) {
+    DisplayLockGuard lock(this);
+    if (dashboard_screen_ == nullptr) return;
+
+    // 三餐：空 → 未排
+    auto meal = [](const std::string& s) { return s.empty() ? std::string("未排") : s; };
+    std::string meals = "早 " + meal(d.breakfast) +
+                        "\n午 " + meal(d.lunch) +
+                        "\n晚 " + meal(d.dinner);
+    lv_label_set_text(dash_meals_, meals.c_str());
+
+    // 库存：name quantity，用 · 连接；空 → 占位
+    std::string fridge;
+    for (const auto& it : d.inventory) {
+        if (!fridge.empty()) fridge += "  ·  ";
+        fridge += it.name + it.quantity;
+    }
+    if (fridge.empty()) fridge = "（空）";
+    lv_label_set_text(dash_fridge_, fridge.c_str());
+
+    // 天气：缺 → —
+    if (d.has_weather) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s %d°C", d.weather_text.c_str(), d.weather_temp);
+        lv_label_set_text(dash_weather_, buf);
+    } else {
+        lv_label_set_text(dash_weather_, "—");
+    }
+
+    // stale 角标
+    if (d.stale_minutes > 0) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "数据 %d 分钟前", d.stale_minutes);
+        lv_label_set_text(dash_stale_, buf);
+        lv_obj_remove_flag(dash_stale_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(dash_stale_, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void CustomLcdDisplay::SetIndoor(float temp_c, float humidity) {
+    DisplayLockGuard lock(this);
+    if (dash_indoor_ == nullptr) return;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "室内 %.1f°C  湿度 %.0f%%", temp_c, humidity);
+    lv_label_set_text(dash_indoor_, buf);
+}
+
+void CustomLcdDisplay::SetClock(const std::string& hhmm, const std::string& date_weekday) {
+    DisplayLockGuard lock(this);
+    if (dash_clock_ == nullptr) return;
+    std::string s = date_weekday + "  " + hhmm;
+    lv_label_set_text(dash_clock_, s.c_str());
+}
+
+void CustomLcdDisplay::ShowDashboard() {
+    DisplayLockGuard lock(this);
+    if (dashboard_screen_ != nullptr) {
+        lv_screen_load(dashboard_screen_);
+    }
+}
+
+void CustomLcdDisplay::ShowChat() {
+    DisplayLockGuard lock(this);
+    if (chat_screen_ != nullptr) {
+        lv_screen_load(chat_screen_);
+    }
+}
+
+// 轮询设备状态切屏：空闲→信息板，其余（启动/连接/唤醒/说话/升级…）→聊天屏；
+// 回到空闲后停 5s 再切回信息板，避免说完话立刻闪走。
+void CustomLcdDisplay::ScreenSwitchTask(void* arg) {
+    auto* self = static_cast<CustomLcdDisplay*>(arg);
+    const TickType_t period = pdMS_TO_TICKS(200);
+    const int kLingerTicks = 5000 / 200;   // 回 idle 后 5s
+    bool on_dashboard = true;              // SetupUI 已默认载入信息板
+    int  idle_ticks = 0;
+
+    for (;;) {
+        DeviceState state = Application::GetInstance().GetDeviceState();
+        bool active = (state != kDeviceStateIdle);
+
+        if (active) {
+            idle_ticks = 0;
+            if (on_dashboard) {
+                self->ShowChat();
+                on_dashboard = false;
+            }
+        } else {
+            if (!on_dashboard) {
+                if (++idle_ticks >= kLingerTicks) {
+                    self->ShowDashboard();
+                    on_dashboard = true;
+                }
+            }
+        }
+        vTaskDelay(period);
+    }
+}
+
+void CustomLcdDisplay::SetupUI() {
+    // 1. 先让基类在初始 active screen 上建好聊天屏
+    LcdDisplay::SetupUI();
+    {
+        DisplayLockGuard lock(this);
+        chat_screen_ = lv_screen_active();
+    }
+    // 2. 建信息板屏
+    BuildDashboardUI();
+    // 3. 默认载入信息板（空闲屏）
+    ShowDashboard();
+    // 4. M2：喂假数据 + 本地占位，单验布局/渲染（不联网）
+    UpdateDashboard(MakeFakeDashboardData());
+    SetClock("15:00", "6/29 周一");
+    SetIndoor(26.5f, 58.0f);
+    // 5. 起切屏轮询任务
+    if (screen_task_ == nullptr) {
+        xTaskCreate(ScreenSwitchTask, "dash_switch", 4096, this, 3, &screen_task_);
+    }
 }

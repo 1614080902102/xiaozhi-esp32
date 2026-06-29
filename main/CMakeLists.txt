@@ -451,7 +451,9 @@ elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_ePaper_3_97)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_RLCD_4_2)
     set(MANUFACTURER "waveshare")
     set(BOARD_TYPE "esp32-s3-rlcd-4.2")
-    set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)
+    # fridge-board: 用全量 puhui（basic 子集缺常用字，任意餐名/食材会渲染空白）。
+    # 20px 比 14px 更适合冰箱上扫一眼；二进制实测 ~1.3MB，当前分区放得下。
+    set(BUILTIN_TEXT_FONT font_puhui_20_4)
     set(BUILTIN_ICON_FONT font_awesome_30_4)
 elseif(CONFIG_BOARD_TYPE_WAVESHARE_ESP32_S3_TOUCH_LCD_3_49)
     set(MANUFACTURER "waveshare")
