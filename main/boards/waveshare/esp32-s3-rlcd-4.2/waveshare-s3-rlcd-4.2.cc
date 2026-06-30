@@ -27,6 +27,10 @@
 
 #define TAG "waveshare_rlcd_4_2"
 
+// 数据源默认地址：用 mDNS 主机名（跟随 Mac 的 .local，不写死 IP，DHCP 换 IP 也不怕）。
+// NVS 里设了 url 则以 NVS 为准（MCP 工具 self.dashboard.set_url）。
+#define DASHBOARD_DEFAULT_URL "http://MacBook-Pro.local:8765/dashboard.json"
+
 class CustomBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -182,7 +186,7 @@ private:
         vTaskDelay(pdMS_TO_TICKS(8000));   // 等 WiFi / 系统起来
         for (;;) {
             std::string url;
-            { Settings s("dashboard", false); url = s.GetString("url", ""); }
+            { Settings s("dashboard", false); url = s.GetString("url", DASHBOARD_DEFAULT_URL); }
 
             if (url.empty()) {
                 DashboardData d;

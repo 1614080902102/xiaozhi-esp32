@@ -461,11 +461,21 @@ void CustomLcdDisplay::UpdateDashboard(const DashboardData& d) {
                         "\n晚 " + meal(d.dinner);
     lv_label_set_text(dash_meals_, meals.c_str());
 
-    // 库存：name quantity，用 · 连接；空 → 占位
+    // 库存 glance：只列「易腐先吃」那几样名字（库存可能几十项，全堆会溢出屏），
+    // 其余只报总数。无易腐项时退而列前几样库存名。
     std::string fridge;
-    for (const auto& it : d.inventory) {
+    const auto& head = !d.perishable.empty() ? d.perishable : d.inventory;
+    size_t shown = 0;
+    for (const auto& it : head) {
+        if (shown >= 5) break;                 // 最多 5 样，防溢出
         if (!fridge.empty()) fridge += "  ·  ";
-        fridge += it.name + it.quantity;
+        fridge += it.name;
+        ++shown;
+    }
+    size_t total = d.inventory.size();
+    if (total > shown) {
+        if (!fridge.empty()) fridge += "\n";
+        fridge += "库存另有 " + std::to_string(total - shown) + " 项";
     }
     if (fridge.empty()) fridge = "（空）";
     lv_label_set_text(dash_fridge_, fridge.c_str());
