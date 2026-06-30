@@ -128,7 +128,9 @@ private:
     // 时钟任务：每秒刷本地时间（时间由服务器 OTA 校准，TZ=东八区）
     static void ClockTask(void* arg) {
         auto* self = static_cast<CustomBoard*>(arg);
-        setenv("TZ", "CST-8", 1);
+        // xiaozhi 的 ota.cc 已把时区偏移烤进系统时钟（settimeofday 存的是本地时间，
+        // 见 ota.cc timezone_offset），故这里 TZ=UTC0，localtime 不再二次加 8 小时。
+        setenv("TZ", "UTC0", 1);
         tzset();
         static const char* kWeekday[7] = {"周日","周一","周二","周三","周四","周五","周六"};
         for (;;) {
@@ -142,6 +144,9 @@ private:
                 snprintf(dw, sizeof(dw), "%d/%d %s", tm_now.tm_mon + 1, tm_now.tm_mday,
                          kWeekday[tm_now.tm_wday]);
                 self->display_->SetClock(hhmm, dw);
+                if (tm_now.tm_sec == 0) {            // 每分钟记一条，便于核对
+                    ESP_LOGI(TAG, "clock %s %s", dw, hhmm);
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
